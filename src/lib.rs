@@ -91,6 +91,10 @@
 extern crate futures;
 extern crate slab;
 
+#[cfg(target_os = "emscripten")]
+#[macro_use]
+extern crate stdweb;
+
 mod interval;
 mod mpmc;
 mod timer;

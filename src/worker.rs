@@ -8,7 +8,10 @@ use futures::task::Task;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+#[cfg(not(target_os = "emscripten"))]
 use std::thread::{self, Thread};
+#[cfg(target_os = "emscripten")]
+use stdweb;
 
 #[derive(Clone)]
 pub struct Worker {
@@ -18,6 +21,7 @@ pub struct Worker {
 /// Communicate with the timer thread
 struct Tx {
     chan: Arc<Chan>,
+    #[cfg(not(target_os = "emscripten"))]
     worker: Thread,
     tolerance: Duration,
     max_timeout: Duration,
@@ -43,7 +47,12 @@ type ModQueue = Queue<ModTimeout, ()>;
 
 impl Worker {
     /// Spawn a worker, returning a handle to allow communication
-    pub fn spawn(mut wheel: Wheel, builder: Builder) -> Worker {
+    pub fn spawn(wheel: Wheel, builder: Builder) -> Worker {
+        Worker::spawn_inner(wheel, builder)
+    }
+
+    #[cfg(not(target_os = "emscripten"))]
+    fn spawn_inner(mut wheel: Wheel, builder: Builder) -> Worker {
         let tolerance = builder.get_tick_duration();
         let max_timeout = builder.get_max_timeout();
         let capacity = builder.get_channel_capacity();
@@ -75,6 +84,47 @@ impl Worker {
         }
     }
 
+    #[cfg(target_os = "emscripten")]
+    fn spawn_inner(mut wheel: Wheel, builder: Builder) -> Worker {
+        stdweb::initialize();
+
+        let tolerance = builder.get_tick_duration();
+        let max_timeout = builder.get_max_timeout();
+        let capacity = builder.get_channel_capacity();
+
+        // Assert that the wheel has at least capacity available timeouts
+        assert!(wheel.available() >= capacity);
+
+        let chan = Arc::new(Chan {
+            run: AtomicBool::new(true),
+            set_timeouts: Queue::with_capacity(capacity, || wheel.reserve().unwrap()),
+            mod_timeouts: Queue::with_capacity(capacity, || ()),
+        });
+
+        let chan2 = chan.clone();
+
+        {
+            let interval = tolerance.as_secs() as u32 * 1000 + tolerance.subsec_nanos() / 1000000;
+            let cb = move || {
+                run_once(&chan2, &mut wheel);
+            };
+            js!{
+                var cb = @{cb};
+                setInterval(function() {
+                    cb();
+                }, @{interval});
+            }
+        }
+
+        Worker {
+            tx: Arc::new(Tx {
+                chan: chan,
+                tolerance: tolerance,
+                max_timeout: max_timeout,
+            }),
+        }
+    }
+
     /// The earliest a timeout can fire before the requested `Instance`
     pub fn tolerance(&self) -> &Duration {
         &self.tx.tolerance
@@ -86,6 +136,11 @@ impl Worker {
 
     /// Set a timeout
     pub fn set_timeout(&self, when: Instant, task: Task) -> Result<Token, Task> {
+        self.set_timeout_inner(when, task)
+    }
+
+    #[cfg(not(target_os = "emscripten"))]
+    fn set_timeout_inner(&self, when: Instant, task: Task) -> Result<Token, Task> {
         self.tx.chan.set_timeouts.push(SetTimeout(when, task))
             .and_then(|ret| {
                 // Unpark the timer thread
@@ -95,8 +150,19 @@ impl Worker {
             .map_err(|SetTimeout(_, task)| task)
     }
 
+    #[cfg(target_os = "emscripten")]
+    fn set_timeout_inner(&self, when: Instant, task: Task) -> Result<Token, Task> {
+        self.tx.chan.set_timeouts.push(SetTimeout(when, task))
+            .map_err(|SetTimeout(_, task)| task)
+    }
+
     /// Move a timeout
     pub fn move_timeout(&self, token: Token, when: Instant, task: Task) -> Result<(), Task> {
+        self.move_timeout_inner(token, when, task)
+    }
+
+    #[cfg(not(target_os = "emscripten"))]
+    fn move_timeout_inner(&self, token: Token, when: Instant, task: Task) -> Result<(), Task> {
         self.tx.chan.mod_timeouts.push(ModTimeout::Move(token, when, task))
             .and_then(|ret| {
                 self.tx.worker.unpark();
@@ -108,7 +174,17 @@ impl Worker {
                     _ => unreachable!(),
                 }
             })
+    }
 
+    #[cfg(target_os = "emscripten")]
+    fn move_timeout_inner(&self, token: Token, when: Instant, task: Task) -> Result<(), Task> {
+        self.tx.chan.mod_timeouts.push(ModTimeout::Move(token, when, task))
+            .map_err(|v| {
+                match v {
+                    ModTimeout::Move(_, _, task) => task,
+                    _ => unreachable!(),
+                }
+            })
     }
 
     /// Cancel a timeout
@@ -124,42 +200,11 @@ impl Worker {
     }
 }
 
+#[cfg(not(target_os = "emscripten"))]
 fn run(chan: Arc<Chan>, mut wheel: Wheel) {
     while chan.run.load(Ordering::Relaxed) {
-        let now = Instant::now();
+        run_once(&chan, &mut wheel);
 
-        // Fire off all expired timeouts
-        while let Some(task) = wheel.poll(now) {
-            task.notify();
-        }
-
-        // As long as the wheel has capacity to manage new timeouts, read off
-        // of the queue.
-        while let Some(token) = wheel.reserve() {
-            match chan.set_timeouts.pop(token) {
-                Ok((SetTimeout(when, task), token)) => {
-                    wheel.set_timeout(token, when, task);
-                }
-                Err(token) => {
-                    wheel.release(token);
-                    break;
-                }
-            }
-        }
-
-        loop {
-            match chan.mod_timeouts.pop(()) {
-                Ok((ModTimeout::Move(token, when, task), _)) => {
-                    wheel.move_timeout(token, when, task);
-                }
-                Ok((ModTimeout::Cancel(token, when), _)) => {
-                    wheel.cancel(token, when);
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Update `now` in case the tick was extra long for some reason
         let now = Instant::now();
 
         if let Some(next) = wheel.next_timeout() {
@@ -172,9 +217,45 @@ fn run(chan: Arc<Chan>, mut wheel: Wheel) {
     }
 }
 
+fn run_once(chan: &Chan, wheel: &mut Wheel) {
+    let now = Instant::now();
+
+    // Fire off all expired timeouts
+    while let Some(task) = wheel.poll(now) {
+        task.notify();
+    }
+
+    // As long as the wheel has capacity to manage new timeouts, read off
+    // of the queue.
+    while let Some(token) = wheel.reserve() {
+        match chan.set_timeouts.pop(token) {
+            Ok((SetTimeout(when, task), token)) => {
+                wheel.set_timeout(token, when, task);
+            }
+            Err(token) => {
+                wheel.release(token);
+                break;
+            }
+        }
+    }
+
+    loop {
+        match chan.mod_timeouts.pop(()) {
+            Ok((ModTimeout::Move(token, when, task), _)) => {
+                wheel.move_timeout(token, when, task);
+            }
+            Ok((ModTimeout::Cancel(token, when), _)) => {
+                wheel.cancel(token, when);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 impl Drop for Tx {
     fn drop(&mut self) {
         self.chan.run.store(false, Ordering::Relaxed);
+        #[cfg(not(target_os = "emscripten"))]
         self.worker.unpark();
     }
 }

@@ -14,3 +14,6 @@ Timer facilities for Tokio
 [dependencies]
 futures = "0.1"
 slab = "0.3.0"
+
+[target.'cfg(target_os = "emscripten")'.dependencies]
+stdweb = { version = "0.1.3", default-features = false }

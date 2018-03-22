@@ -240,6 +240,7 @@ impl Wheel {
 
     /// Returns the instant in time that corresponds to the next timeout
     /// scheduled in this wheel.
+    #[cfg_attr(target_os = "emscripten", allow(unused))]
     pub fn next_timeout(&self) -> Option<Instant> {
         // TODO: can this be optimized to not look at the whole array?
         let mut min = None;
