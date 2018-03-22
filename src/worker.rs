@@ -6,6 +6,9 @@ use mpmc::Queue;
 use wheel::{Token, Wheel};
 use futures::task::Task;
 use std::sync::Arc;
+#[cfg(target_os = "emscripten")]
+use std::sync::Mutex;
+#[cfg(not(target_os = "emscripten"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 #[cfg(not(target_os = "emscripten"))]
@@ -28,7 +31,10 @@ struct Tx {
 }
 
 struct Chan {
+    #[cfg(not(target_os = "emscripten"))]
     run: AtomicBool,
+    #[cfg(target_os = "emscripten")]
+    interval_id: Mutex<u32>,
     set_timeouts: SetQueue,
     mod_timeouts: ModQueue,
 }
@@ -96,25 +102,27 @@ impl Worker {
         assert!(wheel.available() >= capacity);
 
         let chan = Arc::new(Chan {
-            run: AtomicBool::new(true),
+            interval_id: Mutex::new(0),
             set_timeouts: Queue::with_capacity(capacity, || wheel.reserve().unwrap()),
             mod_timeouts: Queue::with_capacity(capacity, || ()),
         });
 
         let chan2 = chan.clone();
 
-        {
+        *chan.interval_id.lock().unwrap() = {
+            use stdweb::unstable::TryInto;
             let interval = tolerance.as_secs() as u32 * 1000 + tolerance.subsec_nanos() / 1000000;
             let cb = move || {
                 run_once(&chan2, &mut wheel);
             };
-            js!{
+            let res = js!{
                 var cb = @{cb};
-                setInterval(function() {
+                return setInterval(function() {
                     cb();
                 }, @{interval});
-            }
-        }
+            };
+            res.try_into().unwrap()
+        };
 
         Worker {
             tx: Arc::new(Tx {
@@ -252,10 +260,18 @@ fn run_once(chan: &Chan, wheel: &mut Wheel) {
     }
 }
 
+#[cfg(not(target_os = "emscripten"))]
 impl Drop for Tx {
     fn drop(&mut self) {
         self.chan.run.store(false, Ordering::Relaxed);
-        #[cfg(not(target_os = "emscripten"))]
         self.worker.unpark();
+    }
+}
+
+#[cfg(target_os = "emscripten")]
+impl Drop for Tx {
+    fn drop(&mut self) {
+        let id = *self.chan.interval_id.lock().unwrap();
+        js!{ clearInterval(@{id}); }
     }
 }
