@@ -111,7 +111,7 @@ impl Worker {
 
         *chan.interval_id.lock().unwrap() = {
             use stdweb::unstable::TryInto;
-            let interval = tolerance.as_secs() as u32 * 1000 + tolerance.subsec_nanos() / 1000000;
+            let interval = 1000;//tolerance.as_secs() as u32 * 1000 + tolerance.subsec_nanos() / 1000000;
             let cb = move || {
                 run_once(&chan2, &mut wheel);
             };
