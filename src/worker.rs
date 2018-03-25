@@ -5,6 +5,8 @@ use Builder;
 use mpmc::Queue;
 use wheel::{Token, Wheel};
 use futures::task::Task;
+#[cfg(target_os = "emscripten")]
+use std::cmp;
 use std::sync::Arc;
 #[cfg(target_os = "emscripten")]
 use std::sync::Mutex;
@@ -112,6 +114,7 @@ impl Worker {
         *chan.interval_id.lock().unwrap() = {
             use stdweb::unstable::TryInto;
             let interval = tolerance.as_secs() as u32 * 1000 + tolerance.subsec_nanos() / 1000000;
+            let interval = cmp::max(10, interval);      // min interval 10ms for emscripten
             let cb = move || {
                 run_once(&chan2, &mut wheel);
             };
